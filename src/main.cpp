@@ -8,6 +8,13 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+#include "vehicle.h"
+#include "helper.h"
+#include "cost.h"
+#include "constants.h"
+#include <algorithm>
+
 
 using namespace std;
 
@@ -163,6 +170,57 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+int getLaneByd(double d){
+	if(d>=0&&d<4){
+		return 1;
+	}else if(d>=4&&d<8){
+		return 2;
+	}else if(d>=8&&d<12){
+		return 3;
+	}
+	return -1;
+}
+
+double getLaneMaxSpeed(vector<Vehicle> other_vs, int cur_lane, double cur_s, double t){
+	double max_speed = SPEED_LIMIT;
+	double nearest_s = 9999999;
+	for(int i=0;i<other_vs.size();i++){
+		Vehicle v = other_vs[i];
+		double s_at_t = v.get_predict_position(t)[0];
+		if(v.lane==cur_lane && s_at_t > cur_s){
+			if(s_at_t<nearest_s) {
+				nearest_s = s_at_t;
+				max_speed = min(SPEED_LIMIT-0.1, v.v);
+			}
+		}
+	}
+	return max_speed;
+}
+
+bool enoughGapExist(int target_lane, vector<Vehicle> other_vs, double cur_s, double t){
+	double nearest_car_front = 9999999;
+	double nearest_car_back = 0;
+	for(int i=0;i<other_vs.size();i++){
+		Vehicle v = other_vs[i];
+		if(v.lane==target_lane){
+			double s_at_t = v.get_predict_position(t)[0];
+			if(s_at_t > cur_s){
+				if(s_at_t < nearest_car_front) nearest_car_front = s_at_t;
+			}else{
+				if(s_at_t > nearest_car_back) nearest_car_back = s_at_t;
+			}
+		}
+	}
+	std::cout << "gap target_lane:"<< target_lane << std::endl;
+	std::cout << "gap nearest_car_front:"<< nearest_car_front << std::endl;
+	std::cout << "gap cur_s:"<< cur_s << std::endl;
+	std::cout << "gap nearest_car_back:"<< nearest_car_back << std::endl;
+	if((nearest_car_front-cur_s)<30) return false;
+	if((cur_s-nearest_car_back)<30) return false;	
+	return true;
+	
+}
+
 int main() {
   uWS::Hub h;
 
@@ -200,7 +258,18 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+	int lane=1;
+	double ref_vel = 0;
+	double ref_vel_ms = 0;
+	int ref_state = 0; // 0:stay in the lane; 1:prepare for change lane left; 2:prepare for change lane right; 3 change lane left; 4: change lane right;
+	int keep_target = 0;
+	double car_s_v = 0;
+	double car_s_a = 0;
+	double car_d_v = 0;
+	double car_d_a = 0;
+
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&lane,&ref_vel,&ref_vel_ms,&ref_state,&keep_target,&car_s_v,&car_s_a,&car_d_v,&car_d_a](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -223,6 +292,7 @@ int main() {
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
           	double car_s = j[1]["s"];
+						double s_org = car_s;
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
@@ -240,13 +310,250 @@ int main() {
           	json msgJson;
 
           	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+          	vector<double> next_y_vals;						
+
+					  int prev_size = previous_path_x.size();
+						std::cout << "======================================================"<< std::endl;
+						std::cout << "car_s:"<< car_s << std::endl;
+						std::cout << "prev_size:"<< prev_size << std::endl;
+
+						double start_t = 0;
+						if(prev_size>0)
+						{
+							car_s = end_path_s;
+							car_d = end_path_d;
+							start_t = 0.02*prev_size;
+							
+						}
+						vector<Vehicle> other_vs;
+						for(int i=0;i<sensor_fusion.size();i++){
+							double o_x = sensor_fusion[i][1];
+							double o_y = sensor_fusion[i][2];
+							double o_vx = sensor_fusion[i][3];
+							double o_vy = sensor_fusion[i][4];
+							double o_s = sensor_fusion[i][5];
+							double o_d = sensor_fusion[i][6];
+							double o_a = 0;
+							int o_state = 0;//keep lane.
+							Vehicle v = Vehicle(o_x, o_y, o_vx, o_vy, o_a, o_s, o_d, o_state);
+							other_vs.push_back(v);
+						}	
+						Vehicle final_traj;
+						int next_state = 0;
+						int cur_lane = getLaneByd(car_d);
+						if(ref_state==3||ref_state==4){
+							// if the car didn't finish lane change, finish it first.(in the middle of lane change)
+							// continue generate chang lane trajectory
+							next_state = ref_state;
+							cur_lane = keep_target;
+						}else{
+							//decide next state
+							
+							double max_lane_speed = getLaneMaxSpeed(other_vs, cur_lane, car_s, start_t);
+							std::cout << "max_lane_speed:"<< max_lane_speed << std::endl;
+							if(max_lane_speed>=SPEED_LIMIT-1){
+								next_state = 0;
+							}else{
+								if(cur_lane==1){
+									double right_lane_speed = getLaneMaxSpeed(other_vs, cur_lane+1, car_s, start_t);
+									std::cout << "right_lane_speed:"<< right_lane_speed << std::endl;
+									if(right_lane_speed>max_lane_speed) next_state=2;
+								}else if(cur_lane==MAX_LANE_NUMBER){
+									double left_lane_speed = getLaneMaxSpeed(other_vs, cur_lane-1, car_s, start_t);
+									std::cout << "left_lane_speed:"<< left_lane_speed << std::endl;
+									if(left_lane_speed>max_lane_speed) next_state=1;
+								}else{
+									double right_lane_speed = getLaneMaxSpeed(other_vs, cur_lane+1, car_s, start_t);
+									double left_lane_speed = getLaneMaxSpeed(other_vs, cur_lane-1, car_s, start_t);
+									std::cout << "right_lane_speed:"<< right_lane_speed << std::endl;
+									std::cout << "left_lane_speed:"<< left_lane_speed << std::endl;
+									if(right_lane_speed > left_lane_speed){
+										if(right_lane_speed>max_lane_speed) next_state=2;
+									}else{
+										if(left_lane_speed>max_lane_speed) next_state=1;
+									}
+								}
+							}
+							
+						}
+						
+						//check lane change gap
+						double target_lane = cur_lane;
+						if(next_state==1){
+							//check left gap
+							std::cout << "check left gap:" << std::endl;
+							target_lane = cur_lane-1;
+							if(enoughGapExist(target_lane, other_vs, car_s, start_t) && ref_vel>20){
+								next_state = 3;
+							}else{
+								next_state = 0;
+							}
+						}else if(next_state==2){
+							//check right gap
+							std::cout << "check right gap:" << std::endl;
+							target_lane = cur_lane+1;
+							if(enoughGapExist(target_lane, other_vs, car_s, start_t) && ref_vel>20){
+								next_state = 4;
+							}else{
+								next_state = 0;
+							}
+						}
+						
+						// generate trajectories	
+						if(next_state==0){
+							target_lane = cur_lane;
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+						}else{
+							if(next_state==3) target_lane = cur_lane-1;
+							else if(next_state==4) target_lane = cur_lane+1;
+							
+						}
+						std::cout << "cur_lane:"<< cur_lane << std::endl;
+						std::cout << "next_state:"<< next_state << std::endl;
+						std::cout << "target_lane:"<< target_lane << std::endl;
+						
+						double target_max_speed = getLaneMaxSpeed(other_vs, target_lane, car_s, start_t);
+
+						bool too_close=false;
+						//find ref_v to use
+						for(int i=0;i<sensor_fusion.size();i++)
+						{
+							//car is i my lane
+							float d=sensor_fusion[i][6];
+							if(d<(2+4*target_lane+2)&&d>(2+4*target_lane-2))
+							{
+								double vx=sensor_fusion[i][3];
+								double vy=sensor_fusion[i][4];
+								double check_speed=sqrt(vx*vx+vy*vy);
+								double check_car_s=sensor_fusion[i][5];
+								//std::cout << "1check_car_s:"<< check_car_s << std::endl;
+								check_car_s+=((double)prev_size*.02*check_speed);
+								//std::cout << "2check_speed:"<< check_speed << std::endl;
+								//std::cout << "3check_car_s after:"<< check_car_s << std::endl;
+								//std::cout << "4car_s:"<< car_s << std::endl;
+								//std::cout << "5car_real_s:"<< s_org << std::endl;
+								//std::cout << "diff:"<< (car_s-s_org) << std::endl;
+								if((check_car_s>car_s)&&((check_car_s-car_s)<30))
+								{
+									std::cout << "6too_close:"<< (check_car_s-car_s) << std::endl;
+									too_close=true;
+								}
+					
+							}
+					
+						}
+						target_max_speed = target_max_speed*2.24-0.5;
+						std::cout << "ref_vel:"<< ref_vel<<" target_max_speed:"<<target_max_speed<< std::endl;
+						if(too_close){
+							if (ref_vel>target_max_speed-10){
+								ref_vel -= .224;
+							}else{
+								ref_vel = min((target_max_speed-10), (ref_vel+.224));
+							}
+							
+						}else if(ref_vel<target_max_speed){
+							ref_vel = min(target_max_speed, (ref_vel+.224));
+						}else{
+							ref_vel -= .224;
+						}
+
+						vector<double> ptsx;
+	          vector<double> ptsy;
+	          
+	          double ref_x = car_x;
+	          double ref_y = car_y;
+	          double ref_yaw = deg2rad(car_yaw);
+	          
+	          if(prev_size<2){
+							double prev_car_x = car_x - cos(car_yaw);
+							double prev_car_y = car_y - sin(car_yaw);
+							ptsx.push_back(prev_car_x);
+							ptsx.push_back(car_x);
+							ptsy.push_back(prev_car_y);
+	            ptsy.push_back(car_y);
+							
+						}else{
+							ref_x = previous_path_x[prev_size-1];
+							ref_y = previous_path_y[prev_size-1];
+							double prev_ref_x = previous_path_x[prev_size-2];
+							double prev_ref_y = previous_path_y[prev_size-2];
+							ptsx.push_back(prev_ref_x);
+							ptsx.push_back(ref_x);
+							ptsy.push_back(prev_ref_y);
+	            ptsy.push_back(ref_y);
+							ref_yaw = atan2(ref_y-prev_ref_y, ref_x-prev_ref_x);
+
+
+						}
+						vector<double> next_wp0 = getXY(car_s+30,(2+4*(target_lane-1)),map_waypoints_s, map_waypoints_x, map_waypoints_y);
+						vector<double> next_wp1 = getXY(car_s+60,(2+4*(target_lane-1)),map_waypoints_s, map_waypoints_x, map_waypoints_y);
+						vector<double> next_wp2 = getXY(car_s+90,(2+4*(target_lane-1)),map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+						ptsx.push_back(next_wp0[0]);
+						ptsx.push_back(next_wp1[0]);
+						ptsx.push_back(next_wp2[0]);
+
+						ptsy.push_back(next_wp0[1]);
+						ptsy.push_back(next_wp1[1]);
+						ptsy.push_back(next_wp2[1]);
+
+						for(int i=0;i<ptsx.size();i++){
+							double shift_x = ptsx[i]-ref_x;
+							double shift_y = ptsy[i]-ref_y;
+							ptsx[i] = (shift_x*cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
+							ptsy[i] = (shift_x*sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
+							//std::cout << "ptsx:"<< i <<" x"<< ptsx[i]<<" y"<<ptsy[i]<< std::endl;
+						}
+						
+						tk::spline s;
+						s.set_points(ptsx,ptsy); 
+					
+						for(int i=0;i<prev_size;i++){
+							next_x_vals.push_back(previous_path_x[i]);
+							next_y_vals.push_back(previous_path_y[i]);
+						}
+
+						double target_x = 30.0;
+						double target_y = s(target_x);
+						double target_dist = distance(0,0,target_x,target_y);
+						double x_add_on = 0;
+
+						for(int i=0; i<15-prev_size;i++){
+							double N = (target_dist/(0.02*ref_vel/2.24));
+							double x_point = x_add_on+target_x/N;
+							double y_point = s(x_point);
+
+							x_add_on = x_point;
+
+							double x_ref = x_point;
+							double y_ref = y_point;
+
+							x_point = (x_ref*cos(ref_yaw)-y_ref*sin(ref_yaw));
+							y_point = (x_ref*sin(ref_yaw)+y_ref*cos(ref_yaw));
+
+							x_point += ref_x;
+							y_point += ref_y;
+
+							
+							next_x_vals.push_back(x_point);
+							next_y_vals.push_back(y_point);						
+						}
+						//if the car already started changing lane and didn't finish in this round, then keep doing it in the next round.
+						int all_size = next_x_vals.size();
+						double pred_d = getFrenet(next_x_vals[all_size-1], next_y_vals[all_size-1], ref_yaw, map_waypoints_x, map_waypoints_y)[1];
+						if(pred_d<(4*(target_lane-1)+1)||pred_d>(4*(target_lane)-1)) {
+							ref_state = next_state;
+							keep_target = cur_lane;
+						}else ref_state=0;
+												
+
+
+			
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
-
+						
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
