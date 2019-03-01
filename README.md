@@ -1,6 +1,69 @@
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
-   
+
+## Reflection on how to generate paths
+1. Calculate the maximum speed of current lane and neighbor lane.
+2. Choose next state(0:stay in the lane; 1:prepare for change lane left; 2:prepare for change lane right; 3 change lane left; 4: change lane right;).
+   ```
+   int next_state = 0;
+   int cur_lane = getLaneByd(car_d);
+   if(ref_state==3||ref_state==4){
+      // if the car didn't finish lane change, finish it first.(in the middle of lane change)
+      // continue generate chang lane trajectory
+      next_state = ref_state;
+      cur_lane = keep_target;
+   }else{
+      //decide next state
+      double max_lane_speed = getLaneMaxSpeed(other_vs, cur_lane, car_s, start_t);
+      std::cout << "max_lane_speed:"<< max_lane_speed << std::endl;
+      if(max_lane_speed>=SPEED_LIMIT-1){
+         next_state = 0;
+      }else{
+         if(cur_lane==1){
+            double right_lane_speed = getLaneMaxSpeed(other_vs, cur_lane+1, car_s, start_t);
+            std::cout << "right_lane_speed:"<< right_lane_speed << std::endl;
+            if(right_lane_speed>max_lane_speed) next_state=2;
+         }else if(cur_lane==MAX_LANE_NUMBER){
+            double left_lane_speed = getLaneMaxSpeed(other_vs, cur_lane-1, car_s, start_t);
+            std::cout << "left_lane_speed:"<< left_lane_speed << std::endl;
+            if(left_lane_speed>max_lane_speed) next_state=1;
+         }else{
+            double right_lane_speed = getLaneMaxSpeed(other_vs, cur_lane+1, car_s, start_t);
+            double left_lane_speed = getLaneMaxSpeed(other_vs, cur_lane-1, car_s, start_t);
+            std::cout << "right_lane_speed:"<< right_lane_speed << std::endl;
+            std::cout << "left_lane_speed:"<< left_lane_speed << std::endl;
+            if(right_lane_speed > left_lane_speed){
+               if(right_lane_speed>max_lane_speed) next_state=2;
+            }else{
+               if(left_lane_speed>max_lane_speed) next_state=1;
+            }
+         }
+      }
+   }
+   //check lane change gap
+   double target_lane = cur_lane;
+   if(next_state==1){
+      //check left gap
+      std::cout << "check left gap:" << std::endl;
+      target_lane = cur_lane-1;
+      if(enoughGapExist(target_lane, other_vs, car_s, start_t) && ref_vel>20){
+         next_state = 3;
+      }else{
+         next_state = 0;
+      }
+   }else if(next_state==2){
+      //check right gap
+      std::cout << "check right gap:" << std::endl;
+      target_lane = cur_lane+1;
+      if(enoughGapExist(target_lane, other_vs, car_s, start_t) && ref_vel>20){
+         next_state = 4;
+      }else{
+         next_state = 0;
+      }
+   }
+   ```
+3. Generate trajectories to target lane using spline.
+
 ### Simulator.
 You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases/tag/T3_v1.2).  
 
